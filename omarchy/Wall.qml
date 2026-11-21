@@ -8,6 +8,10 @@ WebEngineView {
   settings.localContentCanAccessFileUrls: true
   settings.localContentCanAccessRemoteUrls: true
   onContextMenuRequested: (request) => request.accepted = true
+  onJavaScriptConsoleMessage: (level, message, line, source) => console.log("page:", message, "(line " + line + ")")
+  // a crashed renderer would leave a frozen frame: load the page again
+  onRenderProcessTerminated: (status, code) => { console.log("page: renderer ended (" + status + "), reloading"); reloadTimer.start() }
+  Timer { id: reloadTimer; interval: 1500; onTriggered: web.reload() }
 
   function setPaused(p) { runJavaScript("window.__lw&&__lw(" + (p ? "true" : "false") + ")") }
 

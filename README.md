@@ -2,7 +2,10 @@
 
 Any HTML page as a live wallpaper, on macOS and on [Omarchy](https://omarchy.org) (Arch + Hyprland).
 
-Ships with an animated ASCII black hole (`examples/black-hole.html`).
+Ships with two pages:
+
+- `examples/black-hole.html`: an animated ASCII black hole.
+- `examples/ascii-weather.html`: the live sky from [webgl-weather](https://github.com/HugoluizMTB/webgl-weather), redrawn in ASCII. Sky color by the hour, sun, moon in today's real phase, stars, clouds, rain, drops on the glass, lightning, and the temperature drawn in big characters. Data from [Open-Meteo](https://open-meteo.com), place from your IP via [BigDataCloud](https://www.bigdatacloud.com). Open it in a browser to get a control panel (conditions, hour, time-lapse, cloud, rain, storm, wind); the panel stays hidden on the desktop. Preview a condition with `?condition=storm&hour=15`.
 
 ```
 examples/   pages to use as wallpaper
@@ -16,6 +19,7 @@ omarchy/    Omarchy / Hyprland version: C++, Qt WebEngine, layer-shell
 - Caps the page's `requestAnimationFrame` at 20 fps.
 - Pauses the animation when a window covers 90% or more of a display (fullscreen games included), when the screen sleeps or locks, and when the machine runs on battery.
 - Rebuilds itself when displays are plugged in or out.
+- On Omarchy, reloads the page if its renderer crashes, and logs the page's console to the journal.
 
 Uses about 0% CPU while paused. While animating it costs a few hundred MB of RAM, because it is a web view.
 

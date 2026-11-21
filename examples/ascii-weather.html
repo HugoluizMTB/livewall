@@ -1,0 +1,710 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ASCII weather</title>
+<style>
+html,body{margin:0;height:100%;background:#000;overflow:hidden}
+#sky{display:block;width:100vw;height:100vh}
+</style>
+</head>
+<body>
+<canvas id="sky" aria-label="Live weather drawn in ASCII: sky, sun, moon, clouds, rain and lightning"></canvas>
+<script>
+// ASCII weather: the sky from webgl-weather (github.com/HugoluizMTB/webgl-weather)
+// redrawn with characters. Live data from Open-Meteo, place from BigDataCloud (IP).
+// Preview a condition with ?condition=storm&hour=14 (also cloud, rain, storm, wind, city, temp).
+
+"use strict";
+const Q = new URLSearchParams(location.search);
+const num = (k) => (Q.has(k) ? Number(Q.get(k)) : undefined);
+
+// ------------------------------------------------------------ glyphs
+const RAMP = " .,:;-~=+*xo%#&@";            // brightness ramp, dark to bright
+const EXTRA = "|/\\'`oO0°";                  // rain, drops, splashes
+const GLYPHS = RAMP + EXTRA + "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789°:-/()., ";
+const GI = {};
+for (let i = 0; i < GLYPHS.length; i++) if (!(GLYPHS[i] in GI)) GI[GLYPHS[i]] = i;
+const N = RAMP.length;
+const FS = 12;
+
+const cv = document.getElementById("sky"), ctx = cv.getContext("2d");
+let dpr, cw, ch, cols, rows, asp, atlas, mask, mctx, tint, tctx, img, cells;
+let R, G, B, GL, starMap, cD, cCl;
+
+function setup() {
+  dpr = Math.min(devicePixelRatio || 1, 2);
+  const w = cv.clientWidth || innerWidth, h = cv.clientHeight || innerHeight;
+  cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr);
+  const font = `bold ${FS * dpr}px "Courier New", monospace`;
+  ctx.font = font;
+  cw = Math.ceil(ctx.measureText("M").width); ch = Math.ceil(FS * dpr * 1.15);
+  cols = Math.ceil(cv.width / cw); rows = Math.ceil(cv.height / ch);
+  asp = (cols * cw) / (rows * ch);
+  cells = cols * rows;
+
+  atlas = document.createElement("canvas");
+  atlas.width = cw * GLYPHS.length; atlas.height = ch;
+  const a = atlas.getContext("2d");
+  a.font = font; a.textAlign = "center"; a.textBaseline = "middle"; a.fillStyle = "#fff";
+  for (let i = 0; i < GLYPHS.length; i++) a.fillText(GLYPHS[i], i * cw + cw / 2, ch / 2);
+
+  mask = document.createElement("canvas"); mask.width = cv.width; mask.height = cv.height;
+  mctx = mask.getContext("2d");
+  tint = document.createElement("canvas"); tint.width = cols; tint.height = rows;
+  tctx = tint.getContext("2d", { willReadFrequently: true });
+  img = tctx.createImageData(cols, rows);
+
+  R = new Float32Array(cells); G = new Float32Array(cells); B = new Float32Array(cells);
+  GL = new Int16Array(cells); cD = new Float32Array(cells); cCl = new Float32Array(cells); frameN = 0;
+  starMap = new Float32Array(cells);
+  for (let k = 0; k < cells; k++) starMap[k] = Math.random() > 0.985 ? Math.random() + 0.05 : 0;
+  rain.length = 0; glass.length = 0;
+}
+
+// ------------------------------------------------------------ noise (same shapes as the shaders)
+const fract = (x) => x - Math.floor(x);
+const ss = (a, b, x) => { x = Math.min(1, Math.max(0, (x - a) / (b - a))); return x * x * (3 - 2 * x); };
+const mix = (a, b, t) => a + (b - a) * t;
+const clamp01 = (v) => Math.max(0, Math.min(1, v));
+function hash(x, y) {
+  let px = fract(x * 123.34), py = fract(y * 456.21);
+  const d = px * (px + 45.32) + py * (py + 45.32);
+  px += d; py += d;
+  return fract(px * py);
+}
+function noise(x, y) {
+  const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
+  const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+  const a = hash(ix, iy), b = hash(ix + 1, iy), c = hash(ix, iy + 1), d = hash(ix + 1, iy + 1);
+  return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
+}
+function fbm(x, y, oct = 4) {
+  let v = 0, a = 0.5;
+  for (let i = 0; i < oct; i++) {
+    v += a * noise(x, y);
+    const nx = 1.6 * x - 1.2 * y, ny = 1.2 * x + 1.6 * y;
+    x = nx; y = ny; a *= 0.5;
+  }
+  return v;
+}
+
+// ------------------------------------------------------------ weather state
+const PRESETS = {
+  clear:   { cloud: 0.08, rain: 0,    storm: 0,    wind: 0.25 },
+  partly:  { cloud: 0.45, rain: 0,    storm: 0,    wind: 0.3 },
+  cloudy:  { cloud: 0.95, rain: 0,    storm: 0,    wind: 0.3 },
+  drizzle: { cloud: 0.8,  rain: 0.22, storm: 0,    wind: 0.2 },
+  showers: { cloud: 0.6,  rain: 0.5,  storm: 0,    wind: 0.35 },
+  rain:    { cloud: 0.92, rain: 0.65, storm: 0.1,  wind: 0.3 },
+  heavy:   { cloud: 1,    rain: 1,    storm: 0.35, wind: 0.4 },
+  storm:   { cloud: 1,    rain: 0.85, storm: 1,    wind: 0.55 },
+};
+const target = { ...PRESETS.partly, sunrise: 5.3, sunset: 17.6 };
+const cur = { ...target };
+const info = { city: "", temp: null, label: "", hi: null, lo: null, utcOffset: null };
+
+if (Q.has("condition")) Object.assign(target, PRESETS[Q.get("condition")] || {});
+for (const k of ["cloud", "rain", "storm", "wind"]) if (num(k) !== undefined) target[k] = num(k);
+Object.assign(cur, target);
+const manual = Q.has("condition") || Q.has("cloud") || Q.has("rain") || Q.has("storm");
+if (manual) {
+  info.city = Q.get("city") || "Recife";
+  info.temp = num("temp") ?? 27;
+  info.label = Q.get("label") || (Q.get("condition") || "custom").replace(/^./, (c) => c.toUpperCase());
+  info.hi = info.temp + 4; info.lo = info.temp - 3;
+}
+
+const ctl = { hour: num("hour") ?? null, play: false, speed: 2 };   // set by the control panel
+let liveTarget = null;                                               // last live sky, to return to
+function localHour() {
+  if (ctl.hour !== null) return ctl.hour;
+  const now = Date.now();
+  if (info.utcOffset !== null) {
+    const d = new Date(now + info.utcOffset * 1000);
+    return d.getUTCHours() + d.getUTCMinutes() / 60 + d.getUTCSeconds() / 3600;
+  }
+  const d = new Date(now);
+  return d.getHours() + d.getMinutes() / 60;
+}
+
+function moonPhase(date = new Date()) {
+  const days = (date.getTime() - Date.UTC(2000, 0, 6, 18, 14)) / 86400000;
+  return (((days / 29.530588853) % 1) + 1) % 1;
+}
+
+function astro(hour) {
+  const { sunrise, sunset } = cur;
+  const h = ((hour % 24) + 24) % 24, dayLen = sunset - sunrise;
+  const dayT = (h - sunrise) / dayLen;
+  const nightT = ((((h - sunset) % 24) + 24) % 24) / (24 - dayLen);
+  const inNight = nightT <= 1;
+  return {
+    sunX: Math.min(1.1, Math.max(-0.1, dayT)), sunH: Math.sin(Math.PI * dayT),
+    moonX: inNight ? nightT : 1.1, moonH: inNight ? Math.sin(Math.PI * nightT) * 0.75 : -0.3,
+  };
+}
+
+// ------------------------------------------------------------ live data
+const WMO = {
+  0: ["Clear"], 1: ["Mostly clear"], 2: ["Partly cloudy"], 3: ["Cloudy", 0, 0, 0.92],
+  45: ["Fog", 0, 0, 0.9], 48: ["Freezing fog", 0, 0, 0.9],
+  51: ["Light drizzle", 0.12, 0, 0.75], 53: ["Drizzle", 0.2, 0, 0.8], 55: ["Heavy drizzle", 0.3, 0, 0.85],
+  56: ["Freezing drizzle", 0.15, 0, 0.8], 57: ["Freezing drizzle", 0.3, 0, 0.85],
+  61: ["Light rain", 0.35, 0, 0.8], 63: ["Rain", 0.6, 0, 0.9], 65: ["Heavy rain", 0.9, 0.3, 0.97],
+  66: ["Freezing rain", 0.4, 0, 0.85], 67: ["Heavy freezing rain", 0.8, 0, 0.95],
+  71: ["Light snow", 0, 0, 0.85], 73: ["Snow", 0, 0, 0.9], 75: ["Heavy snow", 0, 0, 0.95], 77: ["Snow grains", 0, 0, 0.85],
+  80: ["Light showers", 0.4, 0, 0.6], 81: ["Showers", 0.65, 0, 0.7], 82: ["Heavy showers", 1, 0.35, 0.85],
+  85: ["Snow showers", 0, 0, 0.8], 86: ["Heavy snow showers", 0, 0, 0.9],
+  95: ["Thunderstorm", 0.75, 0.85, 0.95], 96: ["Thunderstorm with hail", 0.85, 1, 1], 99: ["Thunderstorm with heavy hail", 0.95, 1, 1],
+};
+const isoHour = (s, fb) => { const m = s && s.match(/T(\d{2}):(\d{2})/); return m ? +m[1] + m[2] / 60 : fb; };
+const rainFromRate = (r) => (r <= 0.05 ? 0 : clamp01(Math.log10(r / 0.15) / 2.3));
+
+async function locate() {
+  try {
+    const saved = JSON.parse(localStorage.getItem("ascii-weather-place") || "null");
+    if (saved && typeof saved.lat === "number") return saved;
+  } catch {}
+  try {
+    const r = await fetch("https://api.bigdatacloud.net/data/reverse-geocode-client?localityLanguage=en");
+    const g = await r.json();
+    if (typeof g.latitude === "number") {
+      const p = { lat: g.latitude, lon: g.longitude, city: String(g.city || g.locality || "").slice(0, 40) };
+      try { localStorage.setItem("ascii-weather-place", JSON.stringify(p)); } catch {}
+      return p;
+    }
+  } catch {}
+  return { lat: -8.0476, lon: -34.877, city: "Recife" };
+}
+
+async function loadWeather() {
+  const place = await locate();
+  const u = new URL("https://api.open-meteo.com/v1/forecast");
+  u.searchParams.set("latitude", place.lat.toFixed(4));
+  u.searchParams.set("longitude", place.lon.toFixed(4));
+  u.searchParams.set("current", "temperature_2m,precipitation,weather_code,cloud_cover,cloud_cover_low,cloud_cover_mid,cloud_cover_high,wind_speed_10m,wind_direction_10m,wind_gusts_10m");
+  u.searchParams.set("daily", "temperature_2m_max,temperature_2m_min,sunrise,sunset");
+  u.searchParams.set("timezone", "auto");
+  u.searchParams.set("forecast_days", "1");
+  const j = await (await fetch(u)).json();
+  const c = j.current, d = j.daily;
+  const [label, wRain = 0, wStorm = 0, minCloud = 0] = WMO[c.weather_code] || ["Unknown"];
+  const weighted = ((c.cloud_cover_low ?? 0) + (c.cloud_cover_mid ?? 0) * 0.75 + (c.cloud_cover_high ?? 0) * 0.35) / 100;
+  target.cloud = clamp01(Math.max((c.cloud_cover ?? 0) / 100 * 0.85 + weighted * 0.15, minCloud));
+  target.rain = clamp01(Math.max(wRain, rainFromRate((c.precipitation ?? 0) * 4)));
+  target.storm = clamp01(Math.max(wStorm, clamp01(((c.wind_gusts_10m ?? 0) - 55) / 40) * 0.3));
+  const east = -Math.sin(((c.wind_direction_10m ?? 0) * Math.PI) / 180);
+  target.wind = Math.max(-1, Math.min(1, east * Math.max(clamp01((c.wind_speed_10m ?? 0) / 3.6 / 12), 0.08)));
+  target.sunrise = isoHour(d.sunrise?.[0], 5.5);
+  target.sunset = isoHour(d.sunset?.[0], 17.75);
+  Object.assign(info, {
+    city: place.city, temp: Math.round(c.temperature_2m), label,
+    hi: Math.round(d.temperature_2m_max?.[0]), lo: Math.round(d.temperature_2m_min?.[0]),
+    utcOffset: j.utc_offset_seconds ?? 0,
+  });
+  liveTarget = { cloud: target.cloud, rain: target.rain, storm: target.storm, wind: target.wind };
+  bigText = null;
+  if (syncPanel) syncPanel();
+}
+if (!manual) {
+  const run = () => loadWeather().catch(() => {});
+  run(); setInterval(run, 10 * 60 * 1000);
+}
+
+// ------------------------------------------------------------ particles
+const rain = [];   // falling streaks, in cell units
+const glass = [];  // drops sliding on the glass
+const splashes = [];
+let wet = 0, flash = 0, flashT = -1, flashX = 0.5, nextFlash = 3, bolt = null;
+
+function stepParticles(dt) {
+  // rain: count, speed and slant follow intensity and wind
+  const want = Math.round(cur.rain * cols * rows * 0.03);
+  while (rain.length < want) rain.push({ x: Math.random() * cols, y: Math.random() * rows, v: 0, l: 0, z: 0, fresh: true });
+  if (rain.length > want) rain.length = want;
+  const slant = cur.wind * 0.55;
+  for (const d of rain) {
+    if (d.fresh || d.y > rows + d.l) {
+      if (!d.fresh && Math.random() < 0.5) splashes.push({ x: d.x, y: rows - 1 - Math.random() * rows * 0.06, t: 0 });
+      d.z = Math.random();                         // depth: far drops are slower, shorter, dimmer
+      d.v = (28 + 40 * d.z) * (0.7 + 0.5 * cur.rain);
+      d.l = 1 + Math.round(d.z * 3 * (0.6 + cur.rain));
+      d.x = Math.random() * (cols + rows * Math.abs(slant)) - (slant > 0 ? rows * slant : 0);
+      d.y = d.fresh ? Math.random() * rows : -Math.random() * rows * 0.3;
+      d.fresh = false;
+    }
+    d.y += d.v * dt;
+    d.x += d.v * dt * slant;
+  }
+  for (let i = splashes.length - 1; i >= 0; i--) if ((splashes[i].t += dt) > 0.25) splashes.splice(i, 1);
+
+  // glass gets wet with rain and dries on its own
+  wet = clamp01(wet + dt * (cur.rain * 0.25 - 0.02));
+  const wantGlass = Math.round(wet * cols * rows * 0.0025);
+  while (glass.length < wantGlass) glass.push({ x: Math.random() * cols, y: Math.random() * rows, s: Math.random(), v: 0, trail: [] });
+  if (glass.length > wantGlass) glass.length = wantGlass;
+  for (const g of glass) {
+    // big drops overcome surface tension and slide, small ones mostly stay
+    if (g.v === 0 && g.s > 0.55 && Math.random() < dt * 0.15 * (0.4 + cur.rain)) g.v = 2 + g.s * 6;
+    if (g.v > 0) {
+      const py = Math.floor(g.y);
+      g.y += g.v * dt;
+      g.x += (Math.random() - 0.5) * dt * 1.5;
+      if (Math.floor(g.y) !== py) { g.trail.push({ x: Math.floor(g.x), y: py, t: 0 }); }
+      if (g.y > rows) { g.y = -1; g.x = Math.random() * cols; g.v = 0; g.s = Math.random(); }
+      if (Math.random() < dt * 0.4) g.v = 0;  // stops on a dry patch
+    }
+    for (let i = g.trail.length - 1; i >= 0; i--) if ((g.trail[i].t += dt) > 3) g.trail.splice(i, 1);
+  }
+
+  // lightning: scheduled at random, two pulses each, with a visible bolt
+  if (cur.storm > 0.3) {
+    nextFlash -= dt;
+    if (nextFlash <= 0 && flashT < 0) {
+      flashT = 0; flashX = 0.15 + Math.random() * 0.7;
+      nextFlash = (2.5 + Math.random() * 6) / cur.storm;
+      bolt = makeBolt(flashX * cols);
+    }
+  }
+  if (flashT >= 0) {
+    flashT += dt;
+    flash = Math.exp(-flashT * 9) + (flashT > 0.18 ? 0.75 * Math.exp(-(flashT - 0.18) * 7) : 0);
+    if (flashT > 1.4) { flashT = -1; flash = 0; bolt = null; }
+  }
+}
+
+function makeBolt(x0) {
+  const pts = [];
+  const end = rows * (0.45 + Math.random() * 0.4);
+  let x = x0;
+  const branch = (x, y0, y1, out) => {
+    for (let y = y0; y < y1; y++) {
+      const dx = Math.random() < 0.5 ? -1 : 1;
+      const step = Math.random() < 0.6 ? dx : 0;
+      out.push({ x: Math.round(x), y, c: step < 0 ? "/" : step > 0 ? "\\" : "|" });
+      x += step;
+      if (Math.random() < 0.05 && y1 - y > 6) branch(x, y + 1, Math.min(y1, y + 4 + Math.random() * 10), out);
+    }
+  };
+  branch(x, Math.floor(rows * 0.08), Math.floor(end), pts);
+  return pts;
+}
+
+// ------------------------------------------------------------ header text
+let bigText = null;   // coverage of the big temperature, per cell
+function header() {
+  if (info.temp === null) return null;
+  if (bigText) return bigText;
+  // draw the digits in a strip just tall enough for them (CPU-backed, read once),
+  // then average each cell's area down to one coverage value
+  const px = Math.round(Math.min(cv.height * 0.26, cv.width * 0.15));
+  const top = cv.height * 0.1 + ch * 2;
+  const r0 = Math.floor(top / ch), r1 = Math.min(rows, Math.ceil((top + px * 1.1) / ch));
+  const stripW = cols * cw, stripH = (r1 - r0) * ch;
+  const big = document.createElement("canvas"); big.width = stripW; big.height = stripH;
+  const x = big.getContext("2d", { willReadFrequently: true });
+  x.font = `700 ${px}px "Helvetica Neue", "Inter", "Noto Sans", sans-serif`;
+  x.textAlign = "center"; x.textBaseline = "top"; x.fillStyle = "#fff";
+  x.fillText(`${info.temp}°`, cv.width / 2, top - r0 * ch);
+  const d = x.getImageData(0, 0, stripW, stripH).data;
+  const cov = new Float32Array(cells);
+  for (let j = r0; j < r1; j++) for (let i = 0; i < cols; i++) {
+    let sum = 0;
+    for (let yy = 0; yy < ch; yy += 2) for (let xx = 0; xx < cw; xx += 2)
+      sum += d[(((j - r0) * ch + yy) * stripW + i * cw + xx) * 4 + 3];
+    cov[j * cols + i] = sum / (255 * Math.ceil(ch / 2) * Math.ceil(cw / 2));
+  }
+  const tempBottom = Math.ceil((top + px * 1.02) / ch);
+  // cells next to the digits go quiet so the number stands out
+  const near = new Uint8Array(cells);
+  for (let k = 0; k < cells; k++) if (cov[k] > 0.08) {
+    const y = (k / cols) | 0, x = k % cols;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -2; dx <= 2; dx++) {
+      const yy = y + dy, xx = x + dx;
+      if (yy >= 0 && yy < rows && xx >= 0 && xx < cols) near[yy * cols + xx] = 1;
+    }
+  }
+  bigText = { cov, near, cityRow: Math.floor((cv.height * 0.1) / ch), labelRow: tempBottom + 1 };
+  return bigText;
+}
+
+function putText(str, row, r, g, b) {
+  str = String(str);
+  const start = Math.floor(cols / 2 - str.length / 2);
+  for (let i = -1; i <= str.length; i++) {        // one quiet cell on each side
+    const col = start + i;
+    if (i === -1 || i === str.length) { if (col >= 0 && col < cols && row >= 0 && row < rows) GL[row * cols + col] = 0; continue; }
+    if (col < 0 || col >= cols || row < 0 || row >= rows) continue;
+    const k = row * cols + col, gi = GI[str[i]];
+    GL[k] = gi === undefined ? GI["?"] ?? 0 : gi;
+    R[k] = r; G[k] = g; B[k] = b;
+  }
+}
+
+
+// ------------------------------------------------------------ control panel (browser only)
+// livewall injects window.__lw, so the panel never shows on the desktop.
+let panelHour = null, panelHourOut = null, syncPanel = null;
+const fmtHour = (h) => `${String(Math.floor(h)).padStart(2, "0")}:${String(Math.floor((h % 1) * 60)).padStart(2, "0")}`;
+if (!window.__lw && !Q.has("nocontrols")) {
+  const css = document.createElement("style");
+  css.textContent = `
+  #ctl{position:fixed;left:16px;bottom:16px;width:300px;max-width:calc(100vw - 32px);box-sizing:border-box;
+    font:12px/1.4 "Courier New",monospace;color:#cfd6e4;background:rgba(0,0,0,.72);border:1px solid #2a3140;
+    border-radius:8px;padding:10px 12px;backdrop-filter:blur(6px);user-select:none;z-index:2}
+  #ctl.min .body{display:none}
+  #ctl .top{display:flex;justify-content:space-between;align-items:center;gap:8px;cursor:pointer}
+  #ctl b{color:#fff;font-weight:700;letter-spacing:.05em}
+  #ctl .chips{display:flex;flex-wrap:wrap;gap:4px;margin:8px 0}
+  #ctl button{font:inherit;color:#cfd6e4;background:#141924;border:1px solid #2a3140;border-radius:4px;padding:3px 7px;cursor:pointer}
+  #ctl button:hover{border-color:#5a6a88}
+  #ctl button.on{background:#e8edf6;color:#000;border-color:#e8edf6}
+  #ctl label{display:grid;grid-template-columns:52px 1fr 44px;align-items:center;gap:8px;margin:4px 0}
+  #ctl input[type=range]{width:100%;accent-color:#e8edf6}
+  #ctl output{text-align:right;color:#fff}
+  #ctl .row{display:flex;gap:4px;margin-top:6px}
+  #ctl .hint{color:#6c7890;margin-top:6px}`;
+  document.head.appendChild(css);
+  const el = document.createElement("div");
+  el.id = "ctl";
+  el.innerHTML = `
+    <div class="top"><b>[ ascii weather ]</b><span id="ctl-mode">live</span></div>
+    <div class="body">
+      <div class="chips" id="ctl-cond"></div>
+      <label>hour <input id="ctl-hour" type="range" min="0" max="24" step="0.05"><output id="ctl-hour-o"></output></label>
+      <div class="row"><button id="ctl-play">&#9654; time-lapse</button><button id="ctl-speed">2 h/s</button><button id="ctl-live">live</button></div>
+      <label>cloud <input data-k="cloud" type="range" min="0" max="1" step="0.01"><output></output></label>
+      <label>rain <input data-k="rain" type="range" min="0" max="1" step="0.01"><output></output></label>
+      <label>storm <input data-k="storm" type="range" min="0" max="1" step="0.01"><output></output></label>
+      <label>wind <input data-k="wind" type="range" min="-1" max="1" step="0.01"><output></output></label>
+      <div class="hint">click the title to hide &middot; H toggles</div>
+    </div>`;
+  document.body.appendChild(el);
+  const $ = (id) => el.querySelector(id);
+  panelHour = $("#ctl-hour"); panelHourOut = $("#ctl-hour-o");
+  const mode = $("#ctl-mode"), cond = $("#ctl-cond"), sliders = [...el.querySelectorAll("input[data-k]")];
+  const setMode = (m) => { mode.textContent = m; };
+  const ensureHeader = (label) => {
+    if (info.temp === null) { info.temp = 27; info.hi = 31; info.lo = 24; info.city = info.city || "Recife"; }
+    info.label = label; bigText = null;
+  };
+  for (const name of Object.keys(PRESETS)) {
+    const b = document.createElement("button");
+    b.textContent = name;
+    b.onclick = () => {
+      Object.assign(target, PRESETS[name]);
+      for (const x of cond.children) x.classList.toggle("on", x === b);
+      ensureHeader(name.replace(/^./, (c) => c.toUpperCase()));
+      setMode("manual"); syncPanel();
+    };
+    cond.appendChild(b);
+  }
+  panelHour.oninput = () => { ctl.hour = +panelHour.value; panelHourOut.textContent = fmtHour(ctl.hour); setMode("manual"); };
+  for (const sl of sliders) sl.oninput = () => {
+    target[sl.dataset.k] = +sl.value; sl.nextElementSibling.textContent = (+sl.value).toFixed(2);
+    for (const x of cond.children) x.classList.remove("on");
+    setMode("manual");
+  };
+  $("#ctl-play").onclick = (e) => {
+    ctl.play = !ctl.play;
+    if (ctl.play && ctl.hour === null) ctl.hour = localHour();
+    e.target.classList.toggle("on", ctl.play);
+    e.target.innerHTML = ctl.play ? "&#10074;&#10074; pause" : "&#9654; time-lapse";
+    setMode("manual");
+  };
+  const speeds = [0.5, 2, 6];
+  $("#ctl-speed").onclick = (e) => {
+    ctl.speed = speeds[(speeds.indexOf(ctl.speed) + 1) % speeds.length];
+    e.target.textContent = `${ctl.speed} h/s`;
+  };
+  $("#ctl-live").onclick = () => {
+    ctl.hour = null; ctl.play = false;
+    $("#ctl-play").classList.remove("on"); $("#ctl-play").innerHTML = "&#9654; time-lapse";
+    for (const x of cond.children) x.classList.remove("on");
+    if (liveTarget) Object.assign(target, liveTarget);
+    loadWeather().catch(() => {});
+    setMode("live"); syncPanel();
+  };
+  el.querySelector(".top").onclick = () => el.classList.toggle("min");
+  addEventListener("keydown", (e) => { if (e.key === "h" || e.key === "H") el.classList.toggle("min"); });
+  syncPanel = () => {
+    const h = localHour();
+    panelHour.value = h; panelHourOut.textContent = fmtHour(h);
+    for (const sl of sliders) { sl.value = target[sl.dataset.k]; sl.nextElementSibling.textContent = (+target[sl.dataset.k]).toFixed(2); }
+  };
+  if (manual) setMode("manual");
+  syncPanel();
+  setInterval(() => { if (ctl.hour === null) { const h = localHour(); panelHour.value = h; panelHourOut.textContent = fmtHour(h); } }, 30000);
+}
+
+// ------------------------------------------------------------ frame
+const t0 = performance.now();
+let frameN = 0, last = -1e9, phase = moonPhase(), phaseDay = new Date().getDate();
+
+const FPS = 15;   // the sky moves slowly; 15 fps keeps the rain smooth enough and halves the cost
+function frame(now) {
+  if (now - last < 1000 / FPS - 2) { requestAnimationFrame(frame); return; }
+  const dt = Math.min(0.1, Math.max(0, now - last) / 1000); last = now;
+  const t = (now - t0) / 1000;
+  const k = 1 - Math.exp(-dt / 1.6);                 // smooth transitions between conditions
+  for (const key of ["cloud", "rain", "storm", "wind", "sunrise", "sunset"]) cur[key] += (target[key] - cur[key]) * k;
+  if (new Date().getDate() !== phaseDay) { phase = moonPhase(); phaseDay = new Date().getDate(); }
+
+  if (ctl.play) {
+    ctl.hour = ((ctl.hour ?? localHour()) + dt * ctl.speed) % 24;
+    if (panelHour) { panelHour.value = ctl.hour; panelHourOut.textContent = fmtHour(ctl.hour); }
+  }
+  stepParticles(dt);
+  const { sunX, sunH, moonX, moonH } = astro(localHour());
+  const { cloud, rain: rn, storm, wind } = cur;
+  const fl = flash * storm;
+
+  const day = ss(-0.12, 0.3, sunH);
+  const twi = ss(-0.3, -0.02, sunH) * (1 - ss(0.02, 0.4, sunH));
+  const over = clamp01(cloud * 0.72 + rn * 0.35 + storm * 0.3);
+  const heavy = ss(0.55, 1, cloud);
+  const lowSun = 1 - ss(0, 0.45, sunH);
+  const sunC = [mix(1, 1, lowSun), mix(0.93, 0.52, lowSun), mix(0.8, 0.22, lowSun)];
+  const sunVis = ss(-0.08, 0.04, sunH) * (1 - over * 0.92);
+  const moonVis = ss(-0.02, 0.1, moonH) * (1 - day * 0.85) * (1 - over * 0.92);
+  const sunPx = mix(0.12, 0.88, sunX) * asp, sunPy = 0.1 + 0.5 * sunH;
+  const moonPx = mix(0.12, 0.88, moonX) * asp, moonPy = 0.12 + 0.5 * moonH;
+  const SR = 0.05, MR = 0.055;
+  const lit = 0.5 - 0.5 * Math.cos(phase * 2 * Math.PI);
+  const ma = phase * 2 * Math.PI;
+  let lx = -Math.sin(ma), ly = 0.12, lz = -Math.cos(ma);
+  const ll = Math.hypot(lx, ly, lz); lx /= ll; ly /= ll; lz /= ll;
+
+  // grey of an overcast sky
+  let gd = [mix(0.6, 0.43, heavy), mix(0.65, 0.47, heavy), mix(0.71, 0.53, heavy)];
+  gd = gd.map((v, i) => mix(v, [0.28, 0.31, 0.36][i], storm) * (1 - rn * 0.15));
+  const grey = [0.07, 0.08, 0.11].map((v, i) => mix(v, gd[i], day));
+  const cLight0 = [0.26, 0.29, 0.38].map((v, i) => mix(v, mix(1, sunC[i], 0.2 + twi * 0.5), day));
+  const cShade0 = [0.07, 0.08, 0.12].map((v, i) => mix(v, mix([0.62, 0.67, 0.75][i], [0.62, 0.5, 0.52][i], twi), day));
+  const cl1 = cLight0.map((v) => v * mix(1, 0.82, heavy) * mix(1, 0.7, storm * 0.8 + rn * 0.2));
+  const cs1 = cShade0.map((v) => v * mix(1, 0.72, heavy) * mix(1, 0.55, storm));
+  const topC = [0.015, 0.03, 0.1].map((v, i) => mix(mix(v, [0.14, 0.42, 0.84][i], day), [0.2, 0.22, 0.48][i], twi * 0.7));
+  const botC = [0.07, 0.11, 0.25].map((v, i) => mix(mix(v, [0.55, 0.78, 0.96][i], day), [0.98, 0.58, 0.36][i], twi));
+
+  const driftX = t * (0.012 + 0.03 * Math.abs(wind)) * Math.sign(wind + 0.001);
+  const cov = mix(0.62, 0.2, cloud);
+  const lightX = day > 0.2 ? sunPx : moonPx, lightY = day > 0.2 ? sunPy : moonPy;
+  const tick = Math.floor(t * 12);
+  const flashP = flashX * asp;
+  const fresh = (frameN++ % 3) === 0;
+
+  for (let j = 0; j < rows; j++) {
+    const uy = 1 - (j + 0.5) / rows;
+    const skyT = Math.pow(uy, 0.8);
+    const starRow = ss(0.15, 0.55, uy);
+    for (let i = 0; i < cols; i++) {
+      const k = j * cols + i;
+      const ux = (i + 0.5) / cols, px = ux * asp, py = uy;
+
+      // sky gradient, greyed by cover
+      let r = mix(botC[0], topC[0], skyT), g = mix(botC[1], topC[1], skyT), b = mix(botC[2], topC[2], skyT);
+      const ov = over * 0.85;
+      r = mix(r, mix(grey[0] * 1.08, grey[0] * 0.9, uy), ov);
+      g = mix(g, mix(grey[1] * 1.08, grey[1] * 0.9, uy), ov);
+      b = mix(b, mix(grey[2] * 1.08, grey[2] * 0.9, uy), ov);
+      let glyph = -1, glow = 0;
+
+      // stars
+      const sv = (1 - day) * (1 - over) * starRow;
+      if (starMap[k] && sv > 0.02) {
+        const tw = 0.55 + 0.45 * Math.sin(t * (0.8 + starMap[k] * 2.5) + k);
+        const s = starMap[k] * tw * sv;
+        if (s > 0.08) { glyph = GI[".:+*"[Math.min(3, (s * 4) | 0)]]; r = g = b = 0.4 + s * 0.6; b += 0.1; }
+      }
+
+      // sun: bloom, faint rays, disc
+      const dsx = px - sunPx, dsy = py - sunPy, ds = Math.hypot(dsx, dsy);
+      if (sunVis > 0.001 && ds < 0.9) {
+        const ang = Math.atan2(dsy, dsx);
+        let rays = 0.5 + 0.5 * Math.sin(ang * 14 + Math.sin(ang * 5 + t * 0.15) * 2 + t * 0.04);
+        rays = Math.pow(rays, 16) * Math.exp(-(ds - SR) * 9) * 0.06;
+        const bloom = Math.exp(-ds * 5) * 0.28 + Math.exp(-Math.max(ds - SR, 0) * 24) * 0.32 + Math.exp(-Math.max(ds - SR, 0) * 80) * 0.4;
+        const e = (bloom + rays) * sunVis;
+        glow = e;
+        r += sunC[0] * e; g += sunC[1] * e; b += sunC[2] * e;
+        if (ds < SR) {
+          const sd = ds / SR, f = Math.pow(Math.max(1 - sd * sd, 0), 0.35);
+          r = mix(r, mix(sunC[0], 1, f) * 1.08, sunVis); g = mix(g, mix(sunC[1], 0.99, f) * 1.08, sunVis); b = mix(b, mix(sunC[2], 0.95, f) * 1.08, sunVis);
+          glyph = -2;
+        }
+      }
+
+      // moon: sphere lit by today's phase, with maria and earthshine
+      const mx = (px - moonPx) / MR, my = (py - moonPy) / MR, mr = Math.hypot(mx, my);
+      if (moonVis > 0.001) {
+        const dm = mr * MR;
+        const halo = (Math.exp(-dm * 7) * 0.18 + Math.exp(-Math.max(dm - MR, 0) * 30) * 0.22) * lit * moonVis;
+        r += 0.65 * halo; g += 0.74 * halo; b += 0.95 * halo;
+        if (mr < 1) {
+          const z = Math.sqrt(1 - mr * mr);
+          const diff = ss(-0.06, 0.18, mx * lx + my * ly + z * lz);
+          const maria = ss(0.4, 0.72, fbm(mx * 1.5 + 3.1, my * 1.5 + 7.4)) * 0.22;
+          const albedo = Math.min(1, Math.max(0.45, 0.9 - maria - fbm(mx * 6 + 11, my * 6 + 11, 3) * 0.07)) * (0.8 + 0.2 * z);
+          const mc = albedo * diff, shine = albedo * (1 - diff) * 0.22;
+          r = mix(r, Math.max(0.94 * mc + 0.1 * shine, r * 0.6 * (1 - diff)), moonVis);
+          g = mix(g, Math.max(0.95 * mc + 0.12 * shine, g * 0.6 * (1 - diff)), moonVis);
+          b = mix(b, Math.max(0.97 * mc + 0.17 * shine, b * 0.6 * (1 - diff)), moonVis);
+          glyph = -2;
+        }
+      }
+
+      // clouds: warped fBm, two layers, lit from the sun or moon side
+      // (the field drifts slowly, so it is recomputed every third frame and cached)
+      let D, cl;
+      if (fresh) {
+        const qx = px * 1.3, qy = py * 2.2;
+        const wx = fbm(qx * 0.8 + driftX * 0.5, qy * 0.8, 3), wy = fbm(qx * 0.8 + 5.2 - driftX * 0.3, qy * 0.8 + 1.3, 3);
+        const nn = fbm(qx + wx * 0.9 + driftX, qy + wy * 0.9);
+        const dens = ss(cov, cov + 0.22, nn) * mix(0.6, 1, ss(0, 0.7, uy));
+        D = dens;
+        if (cloud > 0.25) D += ss(cov + 0.04, cov + 0.3, fbm(qx * 2.1 - driftX * 0.6 + 11, qy * 2.1 + 11, 3)) * 0.55 * (1 - dens);
+        D = clamp01(D);
+        cl = 0;
+        if (D > 0.01) {
+          let Lx = lightX - px, Ly = lightY - py; const Ll = Math.hypot(Lx, Ly) + 1e-4; Lx /= Ll; Ly /= Ll;
+          const nl = fbm(qx + wx * 0.9 + driftX + Lx * 0.08, qy + wy * 0.9 + Ly * 0.08);
+          cl = clamp01(0.5 + (nn - nl) * 4) * (1 - 0.5 * dens);
+        }
+        cD[k] = D; cCl[k] = cl;
+      } else { D = cD[k]; cl = cCl[k]; }
+      if (D > 0.01) {
+        const cr = mix(cs1[0], cl1[0], cl), cg = mix(cs1[1], cl1[1], cl), cb = mix(cs1[2], cl1[2], cl);
+        r = mix(r, cr, D * 0.95); g = mix(g, cg, D * 0.95); b = mix(b, cb, D * 0.95);
+        const edge = Math.exp(-ds * 4) * D * (1 - D) * 0.9 * ss(-0.08, 0.04, sunH);
+        r += sunC[0] * edge; g += sunC[1] * edge; b += sunC[2] * edge;
+        if (glyph === -2 && D > 0.5) glyph = -1;
+      }
+      const mist = rn * 0.18 * (1 - uy);
+      r = mix(r, grey[0] * 1.1, mist); g = mix(g, grey[1] * 1.1, mist); b = mix(b, grey[2] * 1.1, mist);
+
+      // lightning lights the clouds from inside
+      if (fl > 0.001) {
+        const f = fl * (0.35 + 0.65 * Math.exp(-Math.abs(px - flashP) * 2)) * (0.25 + D * 1.1);
+        r += 0.75 * f; g += 0.8 * f; b += f;
+      }
+      const dim = (1 - (0.16 * heavy + 0.08 * rn) * day) * (1 - 0.18 * Math.hypot(ux - 0.5, uy - 0.5));
+      r *= dim; g *= dim; b *= dim;
+
+      // brightness picks the character; clouds get the dense end of the ramp
+      const lum = 0.3 * r + 0.59 * g + 0.11 * b;
+      if (glyph === -2) {                                   // sun or moon disc
+        glyph = Math.round(Math.min(1, Math.pow(lum, 0.6)) * (N - 1));
+      } else if (glyph < 0 || D > 0.3) {                    // sky and clouds (a star keeps its glyph)
+        // open sky stays sparse (the color does the work); glow and clouds fill in
+        const Isky = 0.06 + 0.28 * Math.min(1, lum) + Math.min(0.6, glow * 0.9) + Math.min(0.4, fl * 0.3);
+        const Icloud = 0.18 + D * 0.5 * Math.max(0.4, Math.min(1, lum * 1.4));
+        let I = mix(Isky, Math.max(Isky, Icloud), ss(0.05, 0.5, D));
+        I *= 0.9 + 0.2 * fract(Math.sin(i * 12.9898 + j * 78.233 + tick) * 43758.5453);
+        glyph = Math.round(Math.min(1, I) * (N - 1));
+      }
+      R[k] = r; G[k] = g; B[k] = b; GL[k] = glyph;
+    }
+  }
+
+  // rain streaks: near drops brighter and longer; slant follows the wind
+  const rc = day > 0.3 ? [0.85, 0.9, 1] : [0.62, 0.7, 0.88];
+  const rch = cur.wind > 0.15 ? GI["\\"] : cur.wind < -0.15 ? GI["/"] : GI["|"];
+  for (const d of rain) {
+    const a = (0.35 + 0.65 * d.z) * (0.6 + 0.4 * cur.rain) + fl * 0.5;
+    for (let s = 0; s < d.l; s++) {
+      const y = Math.floor(d.y - s), x = Math.floor(d.x - s * cur.wind * 0.55);
+      if (y < 0 || y >= rows || x < 0 || x >= cols) continue;
+      const k = y * cols + x, f = a * (1 - s / (d.l + 1));
+      GL[k] = s === 0 && d.z < 0.3 ? GI["'"] : rch;
+      R[k] = Math.max(R[k], rc[0] * f); G[k] = Math.max(G[k], rc[1] * f); B[k] = Math.max(B[k], rc[2] * f);
+    }
+  }
+  for (const s of splashes) {
+    const y = Math.floor(s.y), x = Math.floor(s.x);
+    if (y < 0 || y >= rows || x < 1 || x >= cols - 1) continue;
+    const k = y * cols + x, f = 1 - s.t / 0.25;
+    GL[k] = s.t < 0.1 ? GI["o"] : GI["°"];
+    R[k] = rc[0] * f; G[k] = rc[1] * f; B[k] = rc[2] * f;
+  }
+
+  // drops on the glass: a lens shows the brighter scene behind, with a highlight
+  for (const g of glass) {
+    for (const p of g.trail) {
+      if (p.y < 0 || p.y >= rows || p.x < 0 || p.x >= cols) continue;
+      const k = p.y * cols + p.x, f = 0.35 * (1 - p.t / 3);
+      GL[k] = GI["."]; R[k] += f * 0.6; G[k] += f * 0.7; B[k] += f * 0.8;
+    }
+    const y = Math.floor(g.y), x = Math.floor(g.x);
+    if (y < 0 || y >= rows || x < 0 || x >= cols) continue;
+    const k = y * cols + x;
+    // sample the scene from the opposite side, like a real drop flips what is behind it
+    const sy = Math.min(rows - 1, Math.max(0, y - 2)), sx = Math.min(cols - 1, Math.max(0, x + (g.s > 0.5 ? 1 : -1)));
+    const sk = sy * cols + sx;
+    GL[k] = g.s > 0.8 ? GI["O"] : g.s > 0.4 ? GI["o"] : GI["°"];
+    R[k] = Math.min(1, R[sk] * 1.4 + 0.25); G[k] = Math.min(1, G[sk] * 1.4 + 0.27); B[k] = Math.min(1, B[sk] * 1.4 + 0.3);
+  }
+
+  // lightning bolt
+  if (bolt && flashT < 0.35) {
+    const f = flashT < 0.08 || (flashT > 0.18 && flashT < 0.3) ? 1 : 0.35;
+    for (const p of bolt) {
+      if (p.y < 0 || p.y >= rows || p.x < 0 || p.x >= cols) continue;
+      const k = p.y * cols + p.x;
+      GL[k] = GI[p.c]; R[k] = 0.85 * f + 0.15; G[k] = 0.9 * f + 0.1; B[k] = 1;
+    }
+  }
+
+  // header: city, big temperature drawn with characters, condition, high and low
+  const h = header();
+  if (h) {
+    const tr = 1, tg = 1, tb = 1;
+    for (let k = 0; k < cells; k++) {
+      const c = h.cov[k];
+      if (h.near[k] && c <= 0.08) { GL[k] = Math.min(GL[k], 1); continue; }
+      if (c > 0.08) {
+        GL[k] = c > 0.6 ? N - 1 : c > 0.35 ? GI["#"] : c > 0.18 ? GI["+"] : GI[":"];
+        const m = 0.6 + 0.4 * c;
+        R[k] = mix(R[k], tr, m); G[k] = mix(G[k], tg, m); B[k] = mix(B[k], tb, m);
+      }
+    }
+    if (info.city) putText(info.city, h.cityRow, 1, 1, 1);
+    putText(info.label, h.labelRow, 0.92, 0.94, 0.97);
+    if (info.hi !== null && !Number.isNaN(info.hi)) putText(`H:${info.hi}°  L:${info.lo}°`, h.labelRow + 1, 0.85, 0.88, 0.93);
+  }
+
+  draw();
+  requestAnimationFrame(frame);
+}
+
+function draw() {
+  const d = img.data;
+  mctx.clearRect(0, 0, mask.width, mask.height);
+  for (let j = 0; j < rows; j++) {
+    for (let i = 0; i < cols; i++) {
+      const k = j * cols + i, o = k * 4;
+      // the glyph carries the brightness, so the color is pushed toward full saturation
+      const m = Math.max(R[k], G[k], B[k], 1e-3), s = Math.min(1, Math.pow(m, 0.45)) / m;
+      d[o] = Math.min(255, R[k] * s * 255); d[o + 1] = Math.min(255, G[k] * s * 255); d[o + 2] = Math.min(255, B[k] * s * 255); d[o + 3] = 255;
+      const gi = GL[k];
+      if (gi > 0) mctx.drawImage(atlas, gi * cw, 0, cw, ch, i * cw, j * ch, cw, ch);
+    }
+  }
+  tctx.putImageData(img, 0, 0);
+  ctx.globalCompositeOperation = "copy";
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(tint, 0, 0, cols * cw, rows * ch);
+  ctx.globalCompositeOperation = "destination-in";
+  ctx.drawImage(mask, 0, 0);
+  ctx.globalCompositeOperation = "destination-over";
+  ctx.fillStyle = "#000"; ctx.fillRect(0, 0, cv.width, cv.height);
+  ctx.globalCompositeOperation = "source-over";
+}
+
+addEventListener("resize", () => { setup(); bigText = null; });
+setup();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
