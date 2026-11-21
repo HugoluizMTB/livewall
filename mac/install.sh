@@ -1,9 +1,9 @@
 #!/bin/sh
 # Build livewall, set a page as the wallpaper and start it at login.
-# Usage: ./install.sh [page.html]   (default: examples/black-hole.html)
+# Usage: ./install.sh [page.html]   (default: ../examples/black-hole.html)
 set -eu
 cd "$(dirname "$0")"
-PAGE="${1:-examples/black-hole.html}"
+PAGE="${1:-../examples/black-hole.html}"
 DIR="$HOME/Library/Application Support/livewall"
 LABEL="io.github.livewall"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"

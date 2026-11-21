@@ -1,37 +1,51 @@
 # livewall
 
-Any HTML page as a live macOS wallpaper. One Swift file, no app to install, no dependencies beyond the Xcode command line tools.
+Any HTML page as a live wallpaper, on macOS and on [Omarchy](https://omarchy.org) (Arch + Hyprland).
 
 Ships with an animated ASCII black hole (`examples/black-hole.html`).
 
-## Install
-
-```sh
-git clone https://github.com/HugoluizMTB/livewall && cd livewall
-./install.sh                 # the black hole
-./install.sh my-page.html    # or any page of yours
 ```
-
-It compiles `main.swift`, copies the page to `~/Library/Application Support/livewall/` and adds a LaunchAgent, so it starts at login.
+examples/   pages to use as wallpaper
+mac/        macOS version: one Swift file
+omarchy/    Omarchy / Hyprland version: C++, Qt WebEngine, layer-shell
+```
 
 ## What it does
 
-- One borderless window per display at desktop level, below the desktop icons, on every Space. Clicks pass through.
+- Draws the page behind every window, on every display. Clicks pass through.
 - Caps the page's `requestAnimationFrame` at 20 fps.
-- Pauses the animation when a window covers 90% or more of a display, when the screen sleeps or locks, and when the Mac runs on battery.
+- Pauses the animation when a window covers 90% or more of a display (fullscreen games included), when the screen sleeps or locks, and when the machine runs on battery.
 - Rebuilds itself when displays are plugged in or out.
 
-Uses about 0% CPU while paused. While animating it costs a few hundred MB of RAM (it is a WebKit view).
+Uses about 0% CPU while paused. While animating it costs a few hundred MB of RAM, because it is a web view.
 
-## Remove
+## macOS
+
+Requires macOS 13 or later and `swiftc` (`xcode-select --install`).
 
 ```sh
-./uninstall.sh
+git clone https://github.com/HugoluizMTB/livewall && cd livewall
+./mac/install.sh                 # the black hole
+./mac/install.sh my-page.html    # or any page of yours
+./mac/uninstall.sh               # remove
 ```
 
-## Requirements
+It compiles `mac/main.swift`, copies the page to `~/Library/Application Support/livewall/` and adds a LaunchAgent, so it starts at login.
 
-macOS 13 or later, `swiftc` (`xcode-select --install`).
+## Omarchy (Hyprland)
+
+Requires `qt6-webengine` and `layer-shell-qt` (`omarchy pkg add qt6-webengine layer-shell-qt`).
+
+```sh
+git clone https://github.com/HugoluizMTB/livewall && cd livewall
+./omarchy/install.sh                 # the black hole
+./omarchy/install.sh my-page.html    # or any page of yours
+./omarchy/uninstall.sh               # remove
+```
+
+It builds with `qmake6`, installs `~/.local/bin/livewall`, copies the page to `~/.local/share/livewall/wallpaper.html` and adds `o.launch_on_start("livewall")` to `~/.config/hypr/autostart.lua`, so it starts with Hyprland.
+
+The page sits on the layer-shell background layer, above Omarchy's own background, so theme changes keep working underneath. Coverage is read from `hyprctl` every 2 seconds.
 
 ## License
 

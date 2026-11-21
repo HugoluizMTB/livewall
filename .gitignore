@@ -1,3 +1,4 @@
-livewall
 *.o
 .DS_Store
+mac/livewall
+omarchy/build/
