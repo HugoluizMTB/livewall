@@ -6,6 +6,7 @@ WebEngineView {
   backgroundColor: "black"
   settings.showScrollBars: false
   settings.localContentCanAccessFileUrls: true
+  settings.localContentCanAccessRemoteUrls: true
   onContextMenuRequested: (request) => request.accepted = true
 
   function setPaused(p) { runJavaScript("window.__lw&&__lw(" + (p ? "true" : "false") + ")") }
