@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ASCII black hole</title>
+<style>
+html,body{margin:0;height:100%;background:#000;overflow:hidden}
+#bh{display:block;width:100vw;height:100vh}
+</style>
+</head>
+<body>
+<canvas id="bh" aria-label="Animated ASCII black hole with a spinning accretion disk"></canvas>
+<script>
+const cv=document.getElementById('bh'),ctx=cv.getContext('2d');
+const RAMP=" .,:;-~=+*xo%#&@",N=RAMP.length,STARS=".:+*";
+const STOPS=[[0,[40,8,0]],[.3,[150,35,0]],[.55,[255,105,15]],[.75,[255,185,80]],[.9,[255,238,190]],[1,[255,255,255]]];
+const FS=11,RIN=1.9,ROUT=6.5;
+let dpr,cw,ch,cols,rows,atlas,stars,font;
+let mx=.5,my=.5,K=.25,R=0;const t0=performance.now();
+function col(v){for(let i=1;i<STOPS.length;i++){if(v<=STOPS[i][0]){const[a,ca]=STOPS[i-1],[b,cb]=STOPS[i],f=(v-a)/(b-a);return`rgb(${ca.map((c,k)=>Math.round(c+(cb[k]-c)*f)).join(',')})`}}return'#fff'}
+function setup(){
+dpr=Math.min(devicePixelRatio||1,2);
+const w=cv.clientWidth||680,h=cv.clientHeight||440;
+cv.width=w*dpr;cv.height=h*dpr;
+font=`bold ${FS*dpr}px "Courier New",monospace`;
+ctx.font=font;
+cw=Math.ceil(ctx.measureText('M').width);ch=Math.ceil(FS*dpr*1.15);
+cols=Math.ceil(cv.width/cw);rows=Math.ceil(cv.height/ch);
+atlas=document.createElement('canvas');atlas.width=cw*N;atlas.height=ch*2;
+const a=atlas.getContext('2d');a.font=font;a.textAlign='center';a.textBaseline='middle';
+for(let i=0;i<N;i++){a.fillStyle=col(i/(N-1));a.fillText(RAMP[i],i*cw+cw/2,ch/2)}
+for(let i=0;i<STARS.length;i++){a.globalAlpha=[.35,.55,.8,1][i];a.fillStyle='#b4d0ff';a.fillText(STARS[i],i*cw+cw/2,ch*1.5)}
+stars=new Float32Array(cols*rows);
+for(let k=0;k<stars.length;k++)stars[k]=Math.random()>.986?Math.random()+.05:0;
+}
+const ss=(a,b,x)=>{x=Math.min(1,Math.max(0,(x-a)/(b-a)));return x*x*(3-2*x)};
+const fract=x=>x-Math.floor(x);
+function disk(rd,th,t){
+const om=2.2/Math.pow(rd,1.5),a=th-t*om;
+const n=.55+.22*Math.sin(a*3+Math.log(rd)*8)+.16*Math.sin(a*8-rd*4)+.10*Math.sin(a*17+rd*9-t*2);
+const f=Math.exp(-(rd-RIN)*.55)*ss(RIN,RIN+.25,rd)*(1-ss(ROUT-1.8,ROUT,rd));
+return n*f*(1+.55*Math.cos(th))*1.35;
+}
+function frame(now){
+const t=(now-t0)/1000;
+K+=((.24+(my-.5)*.3+.04*Math.sin(t*.23))-K)*.05;
+R+=(((mx-.5)*.5+.05*Math.sin(t*.17))-R)*.05;
+const cr=Math.cos(R),sr=Math.sin(R);
+const S=Math.min(cv.width/14,cv.height/7.2);
+const hx=cols/2,hy=rows/2,tick=Math.floor(t*12);
+ctx.fillStyle='#000';ctx.fillRect(0,0,cv.width,cv.height);
+for(let j=0;j<rows;j++){
+const qy=(j+.5-hy)*ch/S;
+for(let i=0;i<cols;i++){
+const qx=(i+.5-hx)*cw/S;
+const px=qx*cr+qy*sr,py=-qx*sr+qy*cr;
+const r=Math.hypot(px,py);
+const dyd=py/K,rd=Math.hypot(px,dyd);
+const inDisk=rd>RIN&&rd<ROUT,front=inDisk&&py>0;
+let I=0;
+if(inDisk&&(r>1||front))I=disk(rd,Math.atan2(dyd,px),t);
+if(!front&&r>=1){
+I+=Math.exp(-(((r-1.07)/.05)**2))*.95;
+const rl=RIN+(r-1.12)*2.6;
+if(rl>RIN&&rl<ROUT){const w=.3+.7*Math.max(0,-py/r);I+=disk(rl,Math.atan2(-Math.abs(py),px),t)*w*.9}
+I+=.06/(r*r);
+}
+const k=j*cols+i;
+if(I>.04){
+I*=.88+.24*fract(Math.sin(i*12.9898+j*78.233+tick)*43758.5453);
+const L=Math.round(Math.pow(Math.min(1,I),.8)*(N-1));
+if(L>0)ctx.drawImage(atlas,L*cw,0,cw,ch,i*cw,j*ch,cw,ch);
+}else if(stars[k]&&r>1.4){
+const tw=.5+.5*Math.sin(t*(1+stars[k]*3)+k);
+const s=Math.min(3,(stars[k]*tw*4)|0);
+ctx.drawImage(atlas,s*cw,ch,cw,ch,i*cw,j*ch,cw,ch);
+}
+}
+}
+requestAnimationFrame(frame);
+}
+cv.addEventListener('mousemove',e=>{const b=cv.getBoundingClientRect();mx=(e.clientX-b.left)/b.width;my=(e.clientY-b.top)/b.height});
+cv.addEventListener('touchmove',e=>{const b=cv.getBoundingClientRect(),p=e.touches[0];mx=(p.clientX-b.left)/b.width;my=(p.clientY-b.top)/b.height},{passive:true});
+addEventListener('resize',setup);
+setup();requestAnimationFrame(frame);
+</script>
+</body>
+</html>
